@@ -34,6 +34,30 @@ def send_bdpu_every_sec():
         # TODO Send BDPU every second if necessary
         time.sleep(1)
 
+def parse_switch_conf(path):
+    interfaces = {}
+    with open(path) as f:
+        i = 0;
+        for line in f:
+            if i == 0:
+                priority = line
+            else:
+                words = line.split()
+                if (words[1] != 'T'):
+                    interfaces[words[0]] = int(words[1])
+                else:
+                    interfaces[words[0]] = words[1]
+            i += 1;
+    return priority, interfaces
+
+def process_data_and_send(vlan_interfaces, send_interface, frame_vlan, data, length):
+    if vlan_interfaces[get_interface_name(send_interface)] == 'T':
+        vlan_header = create_vlan_tag(frame_vlan)
+        data = data[0 : 12] + vlan_header + data[12 : length]
+        send_to_link(send_interface, data, length + 4)
+    elif vlan_interfaces[get_interface_name(send_interface)] == frame_vlan:
+        send_to_link(send_interface, data, length)
+
 def main():
     # init returns the max interface number. Our interfaces
     # are 0, 1, 2, ..., init_ret value + 1
@@ -41,6 +65,13 @@ def main():
 
     num_interfaces = wrapper.init(sys.argv[2:])
     interfaces = range(0, num_interfaces)
+    
+    priority, vlan_interfaces = parse_switch_conf("configs/switch{}.cfg".format(switch_id))
+        
+    cam_table = {}
+    for inter, vlan in vlan_interfaces.items():
+        if (vlan != 'T'):
+            cam_table[vlan] = {}
 
     print("# Starting switch with id {}".format(switch_id), flush=True)
     print("[INFO] Switch MAC", ':'.join(f'{b:02x}' for b in get_switch_mac()))
@@ -54,6 +85,7 @@ def main():
         print(get_interface_name(i))
 
     while True:
+        print(cam_table)
         # Note that data is of type bytes([...]).
         # b1 = bytes([72, 101, 108, 108, 111])  # "Hello"
         # b2 = bytes([32, 87, 111, 114, 108, 100])  # " World"
@@ -72,11 +104,34 @@ def main():
         print(f'Destination MAC: {dest_mac}')
         print(f'Source MAC: {src_mac}')
         print(f'EtherType: {ethertype}')
+        print(f'VlanID: {vlan_id}')
 
         print("Received frame of size {} on interface {}".format(length, interface), flush=True)
 
-        # TODO: Implement forwarding with learning
-        # TODO: Implement VLAN support
+        # Implement forwarding with learning
+        # Implement VLAN support
+        
+        if vlan_id != -1:
+            if (vlan_id not in cam_table):
+                cam_table[vlan_id] = {}
+            data = data[0 : 12] + data[16 : length]
+            length -= 4
+        
+        if vlan_interfaces[get_interface_name(interface)] == 'T':
+            frame_vlan = vlan_id
+        else:
+            frame_vlan = vlan_interfaces[get_interface_name(interface)]
+
+        cam_table[frame_vlan][src_mac] = interface
+
+        if dest_mac in cam_table[frame_vlan]:
+            i = cam_table[frame_vlan][dest_mac]
+            process_data_and_send(vlan_interfaces, i, frame_vlan, data, length)
+        else:
+            for i in interfaces:
+                if (i != interface):
+                    process_data_and_send(vlan_interfaces, i, frame_vlan, data, length)
+
         # TODO: Implement STP support
 
         # data is of type bytes.
