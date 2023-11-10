@@ -4,7 +4,15 @@ import struct
 import wrapper
 import threading
 import time
+from enum import Enum
+from types import SimpleNamespace
 from wrapper import recv_from_any_link, send_to_link, get_switch_mac, get_interface_name
+
+bpdu_length = 39
+
+class INT_State(Enum):
+    BLOCKING = 0
+    LISTENING = 1
 
 def parse_ethernet_header(data):
     # Unpack the header fields from the byte array
@@ -14,6 +22,8 @@ def parse_ethernet_header(data):
     
     # Extract ethertype. Under 802.1Q, this may be the bytes from the VLAN TAG
     ether_type = (data[12] << 8) + data[13]
+    
+    print(f'ETHER TYPE: {int.to_bytes(ether_type, 2, "big")}')
 
     vlan_id = -1
     # Check for VLAN tag (0x8100 in network byte order is b'\x81\x00')
@@ -24,15 +34,57 @@ def parse_ethernet_header(data):
 
     return dest_mac, src_mac, ether_type, vlan_id
 
+def parse_bpdu(data):
+    dst_mac = data[0 : 6]
+    
+    if (dst_mac != b'\x01\x80\xC2\x00\x00\x00'):
+        return None
+    
+    src_mac = data[6 : 12]
+    llc_length = data[12 : 14]
+    llc_header_dsap = data[14]
+    llc_header_ssap = data[15]
+    control = data[16]
+    
+    if (llc_header_dsap != 0x42 or llc_header_ssap != 0x42 or control != 0x03):
+        return None
+    
+    root_bridge_id = data[17 : 25]
+    root_bridge_cost = data[25 : 29]
+    bridge_id = data[29 : 37]
+    port_id = data[37 : 39]
+    
+    return root_bridge_id, int.from_bytes(root_bridge_cost, 'big'), bridge_id, int.from_bytes(port_id, 'big')
+
+def create_bpdu(root_bridge_id, root_bridge_cost, bridge_id, port_id):
+    data = b'\x01\x80\xC2\x00\x00\x00'
+    data += get_switch_mac()
+    data += int.to_bytes(bpdu_length, 2, 'big')
+    data += int.to_bytes(0x42, 1, 'big')
+    data += int.to_bytes(0x42, 1, 'big')
+    data += int.to_bytes(0x03, 1, 'big')
+    data += root_bridge_id
+    data += int.to_bytes(root_bridge_cost, 4, 'big')
+    data += bridge_id
+    data += int.to_bytes(port_id, 2, 'big')
+    return data
+
 def create_vlan_tag(vlan_id):
     # 0x8100 for the Ethertype for 802.1Q
     # vlan_id & 0x0FFF ensures that only the last 12 bits are used
     return struct.pack('!H', 0x8200) + struct.pack('!H', vlan_id & 0x0FFF)
 
-def send_bdpu_every_sec():
+def send_bdpu_every_sec(stp_data: SimpleNamespace, interfaces, vlan_interfaces):
     while True:
-        # TODO Send BDPU every second if necessary
         time.sleep(1)
+        stp_data.lock.acquire()
+        
+        if stp_data.bridge_id == stp_data.root_bridge:
+            for interface in interfaces:
+                if (vlan_interfaces[get_interface_name(interface)] == 'T'):
+                    data = create_bpdu(stp_data.root_bridge, 0, stp_data.bridge_id, interface)
+                    send_to_link(interface, data, bpdu_length)
+        stp_data.lock.release()
 
 def parse_switch_conf(path):
     interfaces = {}
@@ -40,7 +92,7 @@ def parse_switch_conf(path):
         i = 0;
         for line in f:
             if i == 0:
-                priority = line
+                priority = int(line)
             else:
                 words = line.split()
                 if (words[1] != 'T'):
@@ -73,66 +125,108 @@ def main():
         if (vlan != 'T'):
             cam_table[vlan] = {}
 
-    print("# Starting switch with id {}".format(switch_id), flush=True)
-    print("[INFO] Switch MAC", ':'.join(f'{b:02x}' for b in get_switch_mac()))
-
-    # Create and start a new thread that deals with sending BDPU
-    t = threading.Thread(target=send_bdpu_every_sec)
+    stp_data = SimpleNamespace()
+    stp_data.bridge_id = priority.to_bytes(2, 'big') + get_switch_mac()
+    stp_data.root_bridge = stp_data.bridge_id
+    stp_data.cost = 0
+    stp_data.lock = threading.Lock()
+    stp_data.root_port = -1
+        
+    # Create and start a new thread that deals with sending BDPUF    
+    t = threading.Thread(target=send_bdpu_every_sec, args=(stp_data, interfaces, vlan_interfaces,))
     t.start()
-
-    # Printing interface names
-    for i in interfaces:
-        print(get_interface_name(i))
+    
+    interface_states = {}
+    
+    for interface in interfaces:
+        interface_states[interface] = INT_State.LISTENING
 
     while True:
-        print(cam_table)
         # Note that data is of type bytes([...]).
         # b1 = bytes([72, 101, 108, 108, 111])  # "Hello"
         # b2 = bytes([32, 87, 111, 114, 108, 100])  # " World"
         # b3 = b1[0:2] + b[3:4].
         interface, data, length = recv_from_any_link()
 
-        dest_mac, src_mac, ethertype, vlan_id = parse_ethernet_header(data)
-
-        # Print the MAC src and MAC dst in human readable format
-        dest_mac = ':'.join(f'{b:02x}' for b in dest_mac)
-        src_mac = ':'.join(f'{b:02x}' for b in src_mac)
-
-        # Note. Adding a VLAN tag can be as easy as
-        # tagged_frame = data[0:12] + create_vlan_tag(10) + data[12:]
-
-        print(f'Destination MAC: {dest_mac}')
-        print(f'Source MAC: {src_mac}')
-        print(f'EtherType: {ethertype}')
-        print(f'VlanID: {vlan_id}')
-
-        print("Received frame of size {} on interface {}".format(length, interface), flush=True)
-
-        # Implement forwarding with learning
-        # Implement VLAN support
+        result = parse_bpdu(data)
         
-        if vlan_id != -1:
-            if (vlan_id not in cam_table):
-                cam_table[vlan_id] = {}
-            data = data[0 : 12] + data[16 : length]
-            length -= 4
-        
-        if vlan_interfaces[get_interface_name(interface)] == 'T':
-            frame_vlan = vlan_id
-        else:
-            frame_vlan = vlan_interfaces[get_interface_name(interface)]
+        if (result == None and interface_states[interface] != INT_State.BLOCKING):
+                        
+            dest_mac, src_mac, ethertype, vlan_id = parse_ethernet_header(data)
 
-        cam_table[frame_vlan][src_mac] = interface
+            # Print the MAC src and MAC dst in human readable format
+            dest_mac = ':'.join(f'{b:02x}' for b in dest_mac)
+            src_mac = ':'.join(f'{b:02x}' for b in src_mac)
+            
+            # Note. Adding a VLAN tag can be as easy as
+            # tagged_frame = data[0:12] + create_vlan_tag(10) + data[12:]
 
-        if dest_mac in cam_table[frame_vlan]:
-            i = cam_table[frame_vlan][dest_mac]
-            process_data_and_send(vlan_interfaces, i, frame_vlan, data, length)
-        else:
-            for i in interfaces:
-                if (i != interface):
-                    process_data_and_send(vlan_interfaces, i, frame_vlan, data, length)
+            # Implement forwarding with learning
+            # Implement VLAN support
+            
+            if vlan_id != -1:
+                if (vlan_id not in cam_table):
+                    cam_table[vlan_id] = {}
+                data = data[0 : 12] + data[16 : length]
+                length -= 4
+            
+            if vlan_interfaces[get_interface_name(interface)] == 'T':
+                frame_vlan = vlan_id
+            else:
+                frame_vlan = vlan_interfaces[get_interface_name(interface)]
 
-        # TODO: Implement STP support
+            cam_table[frame_vlan][src_mac] = interface
+
+            if dest_mac in cam_table[frame_vlan]:
+                i = cam_table[frame_vlan][dest_mac]
+                process_data_and_send(vlan_interfaces, i, frame_vlan, data, length)
+            else:
+                for i in interfaces:
+                    if (i != interface):
+                        process_data_and_send(vlan_interfaces, i, frame_vlan, data, length)
+        elif (result != None):
+            root_bridge_id, root_bridge_cost, bridge_id, port_id = result
+            
+            stp_data.lock.acquire()
+            
+            print(f'BPDU ROOT: {root_bridge_id} CURRENT_ROOT: {stp_data.root_bridge}')
+
+            if (root_bridge_id < stp_data.root_bridge):
+                # Set root port
+                stp_data.root_port = interface
+                
+                if (stp_data.root_bridge == stp_data.bridge_id):
+                    for i in interfaces:
+                        if (vlan_interfaces[get_interface_name(i)] == 'T' and \
+                            i != stp_data.root_port):
+                            interface_states[i] = INT_State.BLOCKING
+
+                stp_data.root_bridge = root_bridge_id
+                stp_data.cost = root_bridge_cost + 10
+                
+                if (interface_states[stp_data.root_port] == INT_State.BLOCKING):
+                    interface_states[stp_data.root_port] = INT_State.LISTENING
+                
+                for i in interfaces:
+                    if (vlan_interfaces[get_interface_name(i)] == 'T'):
+                        data = create_bpdu(stp_data.root_bridge, stp_data.cost, stp_data.bridge_id, i)
+                        
+            elif root_bridge_id == stp_data.root_bridge:
+                if (interface == stp_data.root_port and root_bridge_cost + 10 < stp_data.cost):
+                    stp_data.cost = root_bridge_cost + 10
+                elif interface != stp_data.root_port:
+                    if root_bridge_cost > stp_data.cost:
+                        if interface_states[interface] == INT_State.BLOCKING:
+                            interface_states[interface] = INT_State.LISTENING
+            
+            elif bridge_id == stp_data.bridge_id:
+                interface_states[interface] = INT_State.BLOCKING
+            
+            if (stp_data.bridge_id == stp_data.root_bridge):
+                for i in interfaces:
+                    interface_states[i] = INT_State.LISTENING
+             
+            stp_data.lock.release()
 
         # data is of type bytes.
         # send_to_link(i, data, length)
